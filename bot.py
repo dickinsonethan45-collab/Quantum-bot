@@ -28,6 +28,8 @@ PURCHASE_BANNER_FILE = BASE_DIR / "purchase-banner.png"
 SUPPORTER_KEY_PATTERN = re.compile(r"^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 SUPPORTER_KEY_DM_ROLE_ID = 1542658696713080849
 SUPPORTER_KEY_DM_INPUT_PATTERN = re.compile(r"^\d{1,4}-\d{1,4}-\d{1,4}$")
+CREDENTIAL_ID_DM_INPUT_PATTERN = re.compile(r"^\d{16}$")
+QUANTUM_ROBUX_STORE_URL = "https://www.roblox.com/game-pass/1941834921/Quantum-Supporter"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -565,16 +567,34 @@ async def send_supporter_key_confirmation_dm(
     key: str,
     paid_via: str,
     granted_by: discord.abc.User,
+    credential_id: str | None = None,
 ) -> None:
+    description = (
+        "Thank you for your purchase, this is your Supporter key, you will "
+        "need it to redeem the supporter role and to access Quantum Mods."
+    )
+    if credential_id:
+        description += (
+            " This is your Credential ID to log into the account, you will "
+            "need this for the menu and auth."
+        )
+
     embed = discord.Embed(
         title="Quantum Purchase Confirmed Only",
-        description=(
-            "Thank you for your purchase, this is your Supporter key, you will "
-            "need it to redeem the supporter role and to access Quantum Mods."
-        ),
+        description=description,
         color=discord.Color.from_rgb(255, 145, 0),
     )
-    embed.add_field(name="Your Supporter Key", value=f"```{key}```", inline=False)
+    embed.add_field(
+        name="Your Supporter Key",
+        value=f"```{key}```",
+        inline=bool(credential_id),
+    )
+    if credential_id:
+        embed.add_field(
+            name="Your Credential ID",
+            value=f"```{credential_id}```",
+            inline=True,
+        )
     embed.add_field(name="Paid Via", value=paid_via, inline=True)
     embed.add_field(name="Granted by", value=granted_by.mention, inline=True)
 
@@ -922,7 +942,7 @@ class QuantumBot(commands.Bot):
             "Explore the shop, discover your next favourite mod, and take your gameplay "
             "to another level with Quantum Animal Company Mods!\n\n"
             f"💳 **[Purchase Quantum — $8.80]({store_url})**\n"
-            "🎮 **Purchase Quantum Robux — 1000 Robux — WIP**"
+            f"🎮 **[Purchase Quantum Robux — 1000 Robux]({QUANTUM_ROBUX_STORE_URL})**"
         )
 
         setting_key = f"purchase_panel_message:{channel_id}"
@@ -930,6 +950,21 @@ class QuantumBot(commands.Bot):
         if saved_message_id:
             try:
                 existing_message = await channel.fetch_message(int(saved_message_id))
+                existing_view = discord.ui.View(timeout=None)
+                existing_view.add_item(
+                    discord.ui.Button(
+                        label="Purchase Quantum",
+                        style=discord.ButtonStyle.link,
+                        url=store_url,
+                    )
+                )
+                existing_view.add_item(
+                    discord.ui.Button(
+                        label="Purchase Quantum Robux",
+                        style=discord.ButtonStyle.link,
+                        url=QUANTUM_ROBUX_STORE_URL,
+                    )
+                )
                 if existing_message.embeds:
                     existing_embed = existing_message.embeds[0]
                     existing_embed.title = None
@@ -937,9 +972,9 @@ class QuantumBot(commands.Bot):
                     existing_embed.url = None
                     existing_embed.colour = discord.Colour.from_rgb(255, 145, 0)
                     existing_embed.set_footer(text="Quantum Animal Company Mods")
-                    await existing_message.edit(content=None, embed=existing_embed)
+                    await existing_message.edit(content=None, embed=existing_embed, view=existing_view)
                 elif existing_message.content:
-                    await existing_message.edit(content=None)
+                    await existing_message.edit(content=None, view=existing_view)
                 logger.info("Quantum purchase panel already exists in channel %s", channel_id)
                 return
             except (ValueError, discord.NotFound):
@@ -956,6 +991,13 @@ class QuantumBot(commands.Bot):
                 label="Purchase Quantum",
                 style=discord.ButtonStyle.link,
                 url=store_url,
+            )
+        )
+        view.add_item(
+            discord.ui.Button(
+                label="Purchase Quantum Robux",
+                style=discord.ButtonStyle.link,
+                url=QUANTUM_ROBUX_STORE_URL,
             )
         )
 
@@ -1246,6 +1288,7 @@ async def redeem(interaction: discord.Interaction) -> None:
     user="The user to DM the supporter key to",
     key="Supporter key, formatted like 0000-0000-0000",
     paid_via="How the purchase was made",
+    credential_id="Credential ID, 16 digits (optional)",
 )
 @app_commands.choices(
     paid_via=[
@@ -1259,6 +1302,7 @@ async def send_supporter_key(
     user: discord.User,
     key: app_commands.Range[str, 1, 14],
     paid_via: app_commands.Choice[str],
+    credential_id: app_commands.Range[str, 16, 16] | None = None,
 ) -> None:
     member = interaction.user
     if not isinstance(member, discord.Member) or not any(
@@ -1275,9 +1319,19 @@ async def send_supporter_key(
         )
         return
 
+    if credential_id is not None and not CREDENTIAL_ID_DM_INPUT_PATTERN.match(
+        credential_id
+    ):
+        await interaction.response.send_message(
+            "The credential ID must be 16 digits, formatted like "
+            "`0000000000000000`.",
+            ephemeral=True,
+        )
+        return
+
     try:
         await send_supporter_key_confirmation_dm(
-            user, key, paid_via.value, interaction.user
+            user, key, paid_via.value, interaction.user, credential_id
         )
     except discord.Forbidden:
         await interaction.response.send_message(
