@@ -16,6 +16,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
+import category_keys
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,6 +33,9 @@ SUPPORTER_KEY_DM_INPUT_PATTERN = re.compile(
 )
 CREDENTIAL_ID_DM_INPUT_PATTERN = re.compile(r"^[A-Za-z0-9]{16}$")
 QUANTUM_ROBUX_STORE_URL = "https://www.roblox.com/game-pass/1941834921/Quantum-Supporter"
+KEY_STATUS_KEYS_PER_PAGE = 60
+KEY_STATUS_CHANNEL_SETTING = "key_status_channel_id"
+KEY_STATUS_MESSAGES_SETTING = "key_status_message_ids"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -213,6 +217,44 @@ def release_key(key: str, user_id: int) -> None:
     except Exception:
         database.rollback()
         raise
+    finally:
+        database.close()
+
+
+def register_category_keys() -> int:
+    """Insert every key from category_keys.py into redeem_keys (ignored if present)."""
+    all_keys = {
+        normalize_key(key)
+        for keys in category_keys.KEY_CATEGORIES.values()
+        for key in keys
+    }
+    database = connect_database()
+    try:
+        database.executemany(
+            "INSERT OR IGNORE INTO redeem_keys (key) VALUES (?)",
+            ((key,) for key in all_keys),
+        )
+        database.commit()
+    finally:
+        database.close()
+    return len(all_keys)
+
+
+def fetch_redeemed_keys(keys: list[str]) -> set[str]:
+    """Return the subset of the given keys that have already been redeemed."""
+    if not keys:
+        return set()
+    database = connect_database()
+    try:
+        placeholders = ",".join("?" for _ in keys)
+        rows = database.execute(
+            f"""
+            SELECT key FROM redeem_keys
+            WHERE key IN ({placeholders}) AND redeemed_by IS NOT NULL
+            """,
+            keys,
+        ).fetchall()
+        return {row["key"] for row in rows}
     finally:
         database.close()
 
@@ -658,6 +700,35 @@ async def send_redemption_log(member: discord.Member, key: str) -> None:
     else:
         logger.warning("Logo file is missing: %s", LOGO_FILE)
         await channel.send(embed=embed)
+
+
+def build_key_status_pages(redeemed: set[str]) -> list[str]:
+    """Build the fixed set of message contents for the key status tracker.
+
+    Each category is split into fixed-size pages so the number of pages (and
+    therefore the number of Discord messages) never changes between refreshes
+    — only the checkmarks do. That lets the refresh loop edit messages by
+    position instead of re-posting.
+    """
+    pages: list[str] = []
+    for category, keys in category_keys.KEY_CATEGORIES.items():
+        chunks = [
+            keys[i : i + KEY_STATUS_KEYS_PER_PAGE]
+            for i in range(0, len(keys), KEY_STATUS_KEYS_PER_PAGE)
+        ] or [[]]
+        total_parts = len(chunks)
+        for part_index, chunk in enumerate(chunks, start=1):
+            title = (
+                f"## {category}"
+                if total_parts == 1
+                else f"## {category} (part {part_index}/{total_parts})"
+            )
+            lines = [
+                f"`{key}`" + (" ✅" if key in redeemed else "")
+                for key in chunk
+            ]
+            pages.append(title + "\n" + "\n".join(lines))
+    return pages
 
 
 class RedeemModal(discord.ui.Modal, title="Redeem Your Key"):
