@@ -574,13 +574,16 @@ async def send_supporter_key_confirmation_dm(
         "need it to redeem the supporter role and to access Quantum Mods."
     )
     if credential_id:
-        description += (
-            " This is your Credential ID to log into the account, you will "
-            "need this for the menu and auth."
+        description = (
+            "Your Supporter Key is used to redeem your Supporter role in our "
+            "Discord server and access Quantum Mods in-game, while your "
+            "Credential ID is used to log in to your Auth account. Please "
+            "keep both your Supporter Key and Credential ID private and "
+            "secure."
         )
 
     embed = discord.Embed(
-        title="Quantum Purchase Confirmed Only",
+        title="Quantum Purchase Confirmed",
         description=description,
         color=discord.Color.from_rgb(255, 145, 0),
     )
