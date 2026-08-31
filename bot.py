@@ -28,7 +28,7 @@ PURCHASE_BANNER_FILE = BASE_DIR / "purchase-banner.png"
 SUPPORTER_KEY_PATTERN = re.compile(r"^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 SUPPORTER_KEY_DM_ROLE_ID = 1542658696713080849
 SUPPORTER_KEY_DM_INPUT_PATTERN = re.compile(r"^\d{1,4}-\d{1,4}-\d{1,4}$")
-CREDENTIAL_ID_DM_INPUT_PATTERN = re.compile(r"^\d{16}$")
+CREDENTIAL_ID_DM_INPUT_PATTERN = re.compile(r"^[A-Za-z0-9]{16}$")
 QUANTUM_ROBUX_STORE_URL = "https://www.roblox.com/game-pass/1941834921/Quantum-Supporter"
 
 logging.basicConfig(
@@ -1288,7 +1288,7 @@ async def redeem(interaction: discord.Interaction) -> None:
     user="The user to DM the supporter key to",
     key="Supporter key, formatted like 0000-0000-0000",
     paid_via="How the purchase was made",
-    credential_id="Credential ID, 16 digits (optional)",
+    credential_id="Credential ID, 16 letters/digits (optional)",
 )
 @app_commands.choices(
     paid_via=[
@@ -1323,7 +1323,7 @@ async def send_supporter_key(
         credential_id
     ):
         await interaction.response.send_message(
-            "The credential ID must be 16 digits, formatted like "
+            "The credential ID must be 16 letters/numbers, formatted like "
             "`0000000000000000`.",
             ephemeral=True,
         )
