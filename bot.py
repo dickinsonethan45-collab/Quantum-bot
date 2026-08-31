@@ -26,6 +26,8 @@ DATABASE_FILE = DATA_DIR / "redemptions.db"
 LOGO_FILE = BASE_DIR / "logo.png"
 PURCHASE_BANNER_FILE = BASE_DIR / "purchase-banner.png"
 SUPPORTER_KEY_PATTERN = re.compile(r"^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
+SUPPORTER_KEY_DM_ROLE_ID = 1542658696713080849
+SUPPORTER_KEY_DM_INPUT_PATTERN = re.compile(r"^\d{1,4}-\d{1,4}-\d{1,4}$")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -553,6 +555,33 @@ async def send_purchase_key_dm(user: discord.User, key: str) -> None:
         logo = discord.File(LOGO_FILE, filename="quantum-purchase-logo.png")
         embed.set_thumbnail(url="attachment://quantum-purchase-logo.png")
         await user.send(embed=embed, file=logo)
+    else:
+        logger.warning("Logo file is missing: %s", LOGO_FILE)
+        await user.send(embed=embed)
+
+
+async def send_supporter_key_confirmation_dm(
+    user: discord.abc.User,
+    key: str,
+    paid_via: str,
+    granted_by: discord.abc.User,
+) -> None:
+    embed = discord.Embed(
+        title="Quantum Purchase Confirmed Only",
+        description=(
+            "Thank you for your purchase, this is your Supporter key, you will "
+            "need it to redeem the supporter role and to access Quantum Mods."
+        ),
+        color=discord.Color.from_rgb(255, 145, 0),
+    )
+    embed.add_field(name="Your Supporter Key", value=f"`{key}`", inline=False)
+    embed.add_field(name="Paid Via", value=paid_via, inline=True)
+    embed.add_field(name="Granted by", value=granted_by.mention, inline=True)
+
+    if LOGO_FILE.exists():
+        image_name = "quantum-supporter-logo.png"
+        embed.set_thumbnail(url=f"attachment://{image_name}")
+        await user.send(embed=embed, file=discord.File(LOGO_FILE, filename=image_name))
     else:
         logger.warning("Logo file is missing: %s", LOGO_FILE)
         await user.send(embed=embed)
@@ -1205,6 +1234,67 @@ async def redeem(interaction: discord.Interaction) -> None:
 
     await interaction.response.send_message(
         f"Redemption panel sent to <#{config.PANEL_CHANNEL_ID}>.", ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="supportgrant",
+    description="DM a user their Quantum Supporter key",
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    user="The user to DM the supporter key to",
+    key="Supporter key, formatted like 0000-0000-0000",
+    paid_via="How the purchase was made",
+)
+@app_commands.choices(
+    paid_via=[
+        app_commands.Choice(name="Sellauth", value="Sellauth"),
+        app_commands.Choice(name="Beta Testing", value="Beta Testing"),
+        app_commands.Choice(name="Free Access", value="Free Access"),
+    ]
+)
+async def send_supporter_key(
+    interaction: discord.Interaction,
+    user: discord.User,
+    key: app_commands.Range[str, 1, 14],
+    paid_via: app_commands.Choice[str],
+) -> None:
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not any(
+        role.id == SUPPORTER_KEY_DM_ROLE_ID for role in member.roles
+    ):
+        await interaction.response.send_message(
+            "You do not have permission to use this command.", ephemeral=True
+        )
+        return
+
+    if not SUPPORTER_KEY_DM_INPUT_PATTERN.match(key):
+        await interaction.response.send_message(
+            "The key must be formatted like `0000-0000-0000`.", ephemeral=True
+        )
+        return
+
+    try:
+        await send_supporter_key_confirmation_dm(
+            user, key, paid_via.value, interaction.user
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"Could not DM {user.mention} — they may have DMs disabled.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException:
+        logger.exception("Could not send supporter key DM")
+        await interaction.response.send_message(
+            "Something went wrong sending the DM. Please try again.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Sent the supporter key DM to {user.mention}.", ephemeral=True
     )
 
 
