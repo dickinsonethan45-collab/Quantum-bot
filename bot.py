@@ -574,7 +574,7 @@ async def send_supporter_key_confirmation_dm(
         ),
         color=discord.Color.from_rgb(255, 145, 0),
     )
-    embed.add_field(name="Your Supporter Key", value=f"`{key}`", inline=False)
+    embed.add_field(name="Your Supporter Key", value=f"```{key}```", inline=False)
     embed.add_field(name="Paid Via", value=paid_via, inline=True)
     embed.add_field(name="Granted by", value=granted_by.mention, inline=True)
 
