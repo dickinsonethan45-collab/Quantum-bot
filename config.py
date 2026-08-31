@@ -25,7 +25,7 @@ REDEMPTION_LOG_CHANNEL_ID = 1543661084659941397
 MOD_UPDATE_CHANNEL_ID = 1542665123125006457
 PURCHASE_CHANNEL_ID = 1543694414801666200
 SUPPORT_PANEL_CHANNEL_ID = 1543010726937886790
-KEY_STATUS_CHANNEL_ID = 0  # TODO: set to the channel where the key status boards should post
+KEY_STATUS_CHANNEL_ID = 1544012555574575144  # TODO: set to the channel where the key status boards should post
 
 # Public links.
 QUANTUM_STORE_URL = "https://quantum1.mysellauth.com/"
