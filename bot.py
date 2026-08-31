@@ -27,7 +27,9 @@ LOGO_FILE = BASE_DIR / "logo.png"
 PURCHASE_BANNER_FILE = BASE_DIR / "purchase-banner.png"
 SUPPORTER_KEY_PATTERN = re.compile(r"^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 SUPPORTER_KEY_DM_ROLE_ID = 1542658696713080849
-SUPPORTER_KEY_DM_INPUT_PATTERN = re.compile(r"^\d{1,4}-\d{1,4}-\d{1,4}$")
+SUPPORTER_KEY_DM_INPUT_PATTERN = re.compile(
+    r"^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$"
+)
 CREDENTIAL_ID_DM_INPUT_PATTERN = re.compile(r"^[A-Za-z0-9]{16}$")
 QUANTUM_ROBUX_STORE_URL = "https://www.roblox.com/game-pass/1941834921/Quantum-Supporter"
 
@@ -1318,7 +1320,9 @@ async def send_supporter_key(
 
     if not SUPPORTER_KEY_DM_INPUT_PATTERN.match(key):
         await interaction.response.send_message(
-            "The key must be formatted like `0000-0000-0000`.", ephemeral=True
+            "The key must be formatted like `0000-0000-0000` (letters and "
+            "numbers allowed).",
+            ephemeral=True,
         )
         return
 
