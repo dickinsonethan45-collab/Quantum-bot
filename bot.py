@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sqlite3
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -171,6 +172,7 @@ def initialize_database() -> int:
         )
         ensure_column(database, "redeem_keys", "category", "TEXT")
         ensure_column(database, "redeem_keys", "position", "INTEGER")
+        ensure_column(database, "key_status_messages", "content_hash", "TEXT")
         database.execute(
             """
             INSERT OR IGNORE INTO sellauth_webhook_deliveries (invoice_id, sent_at)
@@ -323,48 +325,68 @@ def chunk_category_message(category: str, lines: list[str]) -> list[str]:
     return chunks
 
 
-def get_status_message_record(category: str) -> tuple[int, list[int]] | None:
+def get_status_message_record(category: str) -> tuple[int, list[int], str | None] | None:
     database = connect_database()
     try:
         row = database.execute(
-            "SELECT channel_id, message_ids FROM key_status_messages WHERE category = ?",
+            """
+            SELECT channel_id, message_ids, content_hash
+            FROM key_status_messages WHERE category = ?
+            """,
             (category,),
         ).fetchone()
     finally:
         database.close()
     if row is None:
         return None
-    return int(row["channel_id"]), json.loads(row["message_ids"])
+    return int(row["channel_id"]), json.loads(row["message_ids"]), row["content_hash"]
 
 
-def save_status_message_record(category: str, channel_id: int, message_ids: list[int]) -> None:
+def save_status_message_record(
+    category: str, channel_id: int, message_ids: list[int], content_hash: str
+) -> None:
     database = connect_database()
     try:
         database.execute(
             """
-            INSERT INTO key_status_messages (category, channel_id, message_ids)
-            VALUES (?, ?, ?)
+            INSERT INTO key_status_messages (category, channel_id, message_ids, content_hash)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(category) DO UPDATE SET
                 channel_id = excluded.channel_id,
-                message_ids = excluded.message_ids
+                message_ids = excluded.message_ids,
+                content_hash = excluded.content_hash
             """,
-            (category, channel_id, json.dumps(message_ids)),
+            (category, channel_id, json.dumps(message_ids), content_hash),
         )
         database.commit()
     finally:
         database.close()
 
 
-async def refresh_key_status_board(bot: commands.Bot, category: str) -> None:
+async def refresh_key_status_board(bot: commands.Bot, category: str) -> bool:
     """(Re)post or edit the status board message(s) for one key category.
 
     Existing messages are edited in place so the check marks update live;
     new messages are only sent the first time, or if the category grows
-    past what the previous messages could hold.
+    past what the previous messages could hold. Returns True if anything
+    was actually posted/edited, False if the board was already up to date
+    (so the periodic poll can skip needless API calls).
     """
     channel_id = int(getattr(config, "KEY_STATUS_CHANNEL_ID", 0) or 0)
     if channel_id <= 0:
-        return
+        return False
+
+    lines = await asyncio.to_thread(get_category_lines, category)
+    if not lines:
+        return False
+
+    content_hash = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    record = await asyncio.to_thread(get_status_message_record, category)
+    existing_ids = record[1] if record else []
+    previous_hash = record[2] if record else None
+
+    if previous_hash == content_hash and existing_ids:
+        return False
 
     channel = bot.get_channel(channel_id)
     if channel is None:
@@ -372,13 +394,7 @@ async def refresh_key_status_board(bot: commands.Bot, category: str) -> None:
     if not isinstance(channel, discord.abc.Messageable):
         raise TypeError("Configured key status channel cannot receive messages")
 
-    lines = await asyncio.to_thread(get_category_lines, category)
-    if not lines:
-        return
     chunks = chunk_category_message(category, lines)
-
-    record = await asyncio.to_thread(get_status_message_record, category)
-    existing_ids = record[1] if record else []
 
     new_ids: list[int] = []
     for index, content in enumerate(chunks):
@@ -404,7 +420,23 @@ async def refresh_key_status_board(bot: commands.Bot, category: str) -> None:
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
-    await asyncio.to_thread(save_status_message_record, category, channel_id, new_ids)
+    await asyncio.to_thread(
+        save_status_message_record, category, channel_id, new_ids, content_hash
+    )
+    return True
+
+
+async def refresh_all_key_status_boards(bot: commands.Bot) -> list[str]:
+    """Refresh every category's board; returns the categories that changed."""
+    categories = await asyncio.to_thread(get_key_categories)
+    changed: list[str] = []
+    for category in categories:
+        try:
+            if await refresh_key_status_board(bot, category):
+                changed.append(category)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException, TypeError):
+            logger.exception("Could not refresh key status board for %s", category)
+    return changed
 
 
 def get_key_for_user(user_id: int) -> str | None:
@@ -1026,6 +1058,19 @@ class QuantumBot(commands.Bot):
                 "SellAuth purchase DMs are disabled until SELLAUTH_API_KEY is set"
             )
 
+        key_status_channel_id = int(getattr(config, "KEY_STATUS_CHANNEL_ID", 0) or 0)
+        if key_status_channel_id > 0:
+            key_status_interval = max(
+                15, int(getattr(config, "KEY_STATUS_POLL_SECONDS", 30))
+            )
+            self.key_status_poll.change_interval(seconds=key_status_interval)
+            self.key_status_poll.start()
+            logger.info("Key status board polling enabled (%ss)", key_status_interval)
+        else:
+            logger.warning(
+                "Key status boards are disabled until KEY_STATUS_CHANNEL_ID is set"
+            )
+
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -1354,9 +1399,24 @@ class QuantumBot(commands.Bot):
     async def before_sellauth_purchase_poll(self) -> None:
         await self.wait_until_ready()
 
+    @tasks.loop(seconds=30)
+    async def key_status_poll(self) -> None:
+        try:
+            changed = await refresh_all_key_status_boards(self)
+            if changed:
+                logger.info("Key status board(s) updated: %s", ", ".join(changed))
+        except Exception:
+            logger.exception("Unexpected key status board polling error")
+
+    @key_status_poll.before_loop
+    async def before_key_status_poll(self) -> None:
+        await self.wait_until_ready()
+
     async def close(self) -> None:
         if self.sellauth_purchase_poll.is_running():
             self.sellauth_purchase_poll.cancel()
+        if self.key_status_poll.is_running():
+            self.key_status_poll.cancel()
         await super().close()
 
 
