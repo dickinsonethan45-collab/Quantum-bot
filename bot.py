@@ -27,6 +27,7 @@ LOGO_FILE = BASE_DIR / "logo.png"
 PURCHASE_BANNER_FILE = BASE_DIR / "purchase-banner.png"
 SUPPORTER_KEY_PATTERN = re.compile(r"^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 SUPPORTER_KEY_DM_ROLE_ID = 1542658696713080849
+SUPPORTKEYS_COMMAND_ROLE_ID = 1543046349757354167
 SUPPORTER_KEY_DM_INPUT_PATTERN = re.compile(
     r"^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$"
 )
@@ -50,20 +51,62 @@ def connect_database() -> sqlite3.Connection:
     return connection
 
 
+def ensure_column(database: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
+    """Add a column to an existing table if it isn't there yet (cheap migration)."""
+    existing = {row["name"] for row in database.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        database.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
+CATEGORY_HEADER_PATTERN = re.compile(r"^##\s*(.+?)\s*$")
+
+
+def parse_keys_file() -> list[tuple[str, str, int]]:
+    """Parse keys.txt into (key, category, position) tuples.
+
+    A line starting with ``## `` sets the category for the keys that follow
+    it (e.g. ``## ROBUX KEYS``). Plain ``#`` lines are ignored as comments,
+    same as before. ``position`` increments per-category so the original
+    file order can be restored later for the status boards.
+    """
+    entries: list[tuple[str, str, int]] = []
+    if not KEYS_FILE.exists():
+        return entries
+
+    category = "UNCATEGORIZED"
+    position_by_category: dict[str, int] = {}
+    for raw_line in KEYS_FILE.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        header_match = CATEGORY_HEADER_PATTERN.match(line)
+        if header_match:
+            category = header_match.group(1).upper()
+            continue
+        if line.startswith("#"):
+            continue
+        position = position_by_category.get(category, 0)
+        entries.append((normalize_key(line), category, position))
+        position_by_category[category] = position + 1
+
+    return entries
+
+
 def initialize_database() -> int:
-    key_lines: list[str] = []
-    if KEYS_FILE.exists():
-        key_lines.extend(KEYS_FILE.read_text(encoding="utf-8").splitlines())
+    key_categories: dict[str, tuple[str, int]] = {}
+    for key, category, position in parse_keys_file():
+        key_categories.setdefault(key, (category, position))
+
     railway_keys = os.getenv("SUPPORTER_KEYS", "")
     if railway_keys:
-        key_lines.extend(re.split(r"[\s,]+", railway_keys))
+        env_position = 0
+        for raw in re.split(r"[\s,]+", railway_keys):
+            if not raw.strip():
+                continue
+            key_categories.setdefault(normalize_key(raw), ("ENV", env_position))
+            env_position += 1
 
-    keys = {
-        normalize_key(line)
-        for line in key_lines
-        if line.strip() and not line.lstrip().startswith("#")
-    }
-    if not keys:
+    if not key_categories:
         raise RuntimeError(
             "No supporter keys configured. Add keys.txt locally or set the "
             "SUPPORTER_KEYS Railway variable."
@@ -119,6 +162,17 @@ def initialize_database() -> int:
         )
         database.execute(
             """
+            CREATE TABLE IF NOT EXISTS key_status_messages (
+                category TEXT PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                message_ids TEXT NOT NULL
+            )
+            """
+        )
+        ensure_column(database, "redeem_keys", "category", "TEXT")
+        ensure_column(database, "redeem_keys", "position", "INTEGER")
+        database.execute(
+            """
             INSERT OR IGNORE INTO sellauth_webhook_deliveries (invoice_id, sent_at)
             SELECT invoice_id, MIN(sent_at)
             FROM sellauth_dm_deliveries
@@ -127,13 +181,20 @@ def initialize_database() -> int:
         )
         database.executemany(
             "INSERT OR IGNORE INTO redeem_keys (key) VALUES (?)",
-            ((key,) for key in keys),
+            ((key,) for key in key_categories),
+        )
+        database.executemany(
+            "UPDATE redeem_keys SET category = ?, position = ? WHERE key = ?",
+            (
+                (category, position, key)
+                for key, (category, position) in key_categories.items()
+            ),
         )
         database.commit()
     finally:
         database.close()
 
-    return len(keys)
+    return len(key_categories)
 
 
 def reserve_key(key: str, user_id: int) -> tuple[str, str | None]:
@@ -188,6 +249,172 @@ def reserve_key(key: str, user_id: int) -> tuple[str, str | None]:
     except Exception:
         database.rollback()
         raise
+    finally:
+        database.close()
+
+
+def get_key_category(key: str) -> str | None:
+    database = connect_database()
+    try:
+        row = database.execute(
+            "SELECT category FROM redeem_keys WHERE key = ?", (key,)
+        ).fetchone()
+        return str(row["category"]) if row and row["category"] is not None else None
+    finally:
+        database.close()
+
+
+def get_key_categories() -> list[str]:
+    database = connect_database()
+    try:
+        rows = database.execute(
+            """
+            SELECT DISTINCT category FROM redeem_keys
+            WHERE category IS NOT NULL
+            ORDER BY category
+            """
+        ).fetchall()
+        return [str(row["category"]) for row in rows]
+    finally:
+        database.close()
+
+
+def get_category_lines(category: str) -> list[str]:
+    """One display line per key in a category, in original file order."""
+    database = connect_database()
+    try:
+        rows = database.execute(
+            """
+            SELECT key, redeemed_by FROM redeem_keys
+            WHERE category = ?
+            ORDER BY position, key
+            """,
+            (category,),
+        ).fetchall()
+    finally:
+        database.close()
+
+    lines: list[str] = []
+    for row in rows:
+        if row["redeemed_by"] is not None:
+            lines.append(f"{row['key']} - <@{row['redeemed_by']}> ✅")
+        else:
+            lines.append(str(row["key"]))
+    return lines
+
+
+STATUS_MESSAGE_CHAR_LIMIT = 1900  # headroom under Discord's 2000-char message cap
+
+
+def chunk_category_message(category: str, lines: list[str]) -> list[str]:
+    """Split a category's key list into one or more <=2000 char messages."""
+    chunks: list[str] = []
+    part = 1
+    current = f"## {category}"
+    for line in lines:
+        candidate = f"{current}\n{line}"
+        if len(candidate) > STATUS_MESSAGE_CHAR_LIMIT:
+            chunks.append(current)
+            part += 1
+            current = f"## {category} (part {part})\n{line}"
+        else:
+            current = candidate
+    chunks.append(current)
+    return chunks
+
+
+def get_status_message_record(category: str) -> tuple[int, list[int]] | None:
+    database = connect_database()
+    try:
+        row = database.execute(
+            "SELECT channel_id, message_ids FROM key_status_messages WHERE category = ?",
+            (category,),
+        ).fetchone()
+    finally:
+        database.close()
+    if row is None:
+        return None
+    return int(row["channel_id"]), json.loads(row["message_ids"])
+
+
+def save_status_message_record(category: str, channel_id: int, message_ids: list[int]) -> None:
+    database = connect_database()
+    try:
+        database.execute(
+            """
+            INSERT INTO key_status_messages (category, channel_id, message_ids)
+            VALUES (?, ?, ?)
+            ON CONFLICT(category) DO UPDATE SET
+                channel_id = excluded.channel_id,
+                message_ids = excluded.message_ids
+            """,
+            (category, channel_id, json.dumps(message_ids)),
+        )
+        database.commit()
+    finally:
+        database.close()
+
+
+async def refresh_key_status_board(bot: commands.Bot, category: str) -> None:
+    """(Re)post or edit the status board message(s) for one key category.
+
+    Existing messages are edited in place so the check marks update live;
+    new messages are only sent the first time, or if the category grows
+    past what the previous messages could hold.
+    """
+    channel_id = int(getattr(config, "KEY_STATUS_CHANNEL_ID", 0) or 0)
+    if channel_id <= 0:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(channel_id)
+    if not isinstance(channel, discord.abc.Messageable):
+        raise TypeError("Configured key status channel cannot receive messages")
+
+    lines = await asyncio.to_thread(get_category_lines, category)
+    if not lines:
+        return
+    chunks = chunk_category_message(category, lines)
+
+    record = await asyncio.to_thread(get_status_message_record, category)
+    existing_ids = record[1] if record else []
+
+    new_ids: list[int] = []
+    for index, content in enumerate(chunks):
+        if index < len(existing_ids):
+            try:
+                message = await channel.fetch_message(existing_ids[index])
+                await message.edit(content=content)
+                new_ids.append(existing_ids[index])
+                continue
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.warning(
+                    "Could not edit key status message %s for %s; sending a new one",
+                    existing_ids[index],
+                    category,
+                )
+        message = await channel.send(content)
+        new_ids.append(message.id)
+
+    for stale_id in existing_ids[len(new_ids):]:
+        try:
+            stale_message = await channel.fetch_message(stale_id)
+            await stale_message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    await asyncio.to_thread(save_status_message_record, category, channel_id, new_ids)
+
+
+def get_key_for_user(user_id: int) -> str | None:
+    """Look up the supporter key a user has redeemed, if any."""
+    database = connect_database()
+    try:
+        row = database.execute(
+            "SELECT key FROM redeemed_users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return str(row["key"]) if row is not None else None
     finally:
         database.close()
 
@@ -736,6 +963,15 @@ class RedeemModal(discord.ui.Modal, title="Redeem Your Key"):
             logger.exception(
                 "Could not send redemption log for user %s", interaction.user.id
             )
+
+        category = await asyncio.to_thread(get_key_category, key)
+        if category:
+            try:
+                await refresh_key_status_board(bot, category)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException, TypeError):
+                logger.exception(
+                    "Could not refresh the %s key status board", category
+                )
 
         await interaction.followup.send(
             f"Key redeemed successfully — you now have the {role.mention} role!",
@@ -1357,6 +1593,79 @@ async def send_supporter_key(
     await interaction.response.send_message(
         f"Sent the supporter key DM to {user.mention}.", ephemeral=True
     )
+
+
+@bot.tree.command(
+    name="keyboardrefresh",
+    description="Post/refresh the key status boards in the configured channel",
+)
+@app_commands.guild_only()
+async def keyboard_refresh(interaction: discord.Interaction) -> None:
+    if not await bot.is_owner(interaction.user):
+        await interaction.response.send_message(
+            "Only the bot owner can use `/keyboardrefresh`.", ephemeral=True
+        )
+        return
+
+    channel_id = int(getattr(config, "KEY_STATUS_CHANNEL_ID", 0) or 0)
+    if channel_id <= 0:
+        await interaction.response.send_message(
+            "Set `KEY_STATUS_CHANNEL_ID` in config.py first.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    categories = await asyncio.to_thread(get_key_categories)
+    failed: list[str] = []
+    for category in categories:
+        try:
+            await refresh_key_status_board(bot, category)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException, TypeError):
+            logger.exception("Could not refresh key status board for %s", category)
+            failed.append(category)
+
+    if failed:
+        await interaction.followup.send(
+            "Refreshed the key status boards, but these categories failed: "
+            + ", ".join(failed),
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"Refreshed {len(categories)} key status board(s) in <#{channel_id}>.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="supportkeys",
+    description="View your Quantum Supporter key",
+)
+@app_commands.guild_only()
+async def supportkeys(interaction: discord.Interaction) -> None:
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not any(
+        role.id == SUPPORTKEYS_COMMAND_ROLE_ID for role in member.roles
+    ):
+        await interaction.response.send_message(
+            "You do not have permission to use this command.", ephemeral=True
+        )
+        return
+
+    key = get_key_for_user(member.id)
+    if key is None:
+        await interaction.response.send_message(
+            "No supporter key is on file for you. If you believe this is a "
+            "mistake, please open a support ticket.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        description=f"**Your Supporter Key**\n```{key}```",
+        color=discord.Color.from_rgb(255, 145, 0),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.event
