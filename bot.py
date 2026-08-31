@@ -32,6 +32,10 @@ SUPPORTER_KEY_DM_INPUT_PATTERN = re.compile(
 )
 CREDENTIAL_ID_DM_INPUT_PATTERN = re.compile(r"^[A-Za-z0-9]{16}$")
 QUANTUM_ROBUX_STORE_URL = "https://www.roblox.com/game-pass/1941834921/Quantum-Supporter"
+KEY_REDEMPTION_CHANNEL_ID = int(
+    getattr(config, "KEY_REDEMPTION_CHANNEL_ID", 0) or 1544012555574575144
+)
+KEY_REDEEMED_EMOJI = "\u2705"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,6 +118,17 @@ def initialize_database() -> int:
             CREATE TABLE IF NOT EXISTS sellauth_webhook_deliveries (
                 invoice_id TEXT PRIMARY KEY,
                 sent_at TEXT NOT NULL
+            )
+            """
+        )
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS key_channel_posts (
+                key TEXT PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                reacted INTEGER NOT NULL DEFAULT 0,
+                posted_at TEXT NOT NULL
             )
             """
         )
@@ -210,6 +225,123 @@ def release_key(key: str, user_id: int) -> None:
             (key, user_id),
         )
         database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    finally:
+        database.close()
+
+
+def get_all_keys_with_status() -> list[sqlite3.Row]:
+    """Return every known key with its redemption status, oldest-created first."""
+    database = connect_database()
+    try:
+        return database.execute(
+            "SELECT key, redeemed_by, redeemed_at FROM redeem_keys ORDER BY key"
+        ).fetchall()
+    finally:
+        database.close()
+
+
+def get_posted_keys() -> set[str]:
+    database = connect_database()
+    try:
+        rows = database.execute("SELECT key FROM key_channel_posts").fetchall()
+        return {str(row["key"]) for row in rows}
+    finally:
+        database.close()
+
+
+def save_key_channel_post(key: str, channel_id: int, message_id: int, reacted: bool) -> None:
+    database = connect_database()
+    try:
+        database.execute(
+            """
+            INSERT OR IGNORE INTO key_channel_posts
+                (key, channel_id, message_id, reacted, posted_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                key,
+                channel_id,
+                message_id,
+                1 if reacted else 0,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        database.commit()
+    finally:
+        database.close()
+
+
+def mark_key_message_reacted(key: str) -> None:
+    database = connect_database()
+    try:
+        database.execute(
+            "UPDATE key_channel_posts SET reacted = 1 WHERE key = ?", (key,)
+        )
+        database.commit()
+    finally:
+        database.close()
+
+
+def get_unreacted_redeemed_key_messages() -> list[sqlite3.Row]:
+    """Keys that are redeemed, have a posted channel message, but no tick yet."""
+    database = connect_database()
+    try:
+        return database.execute(
+            """
+            SELECT kcp.key AS key, kcp.channel_id AS channel_id, kcp.message_id AS message_id
+            FROM key_channel_posts AS kcp
+            JOIN redeem_keys AS rk ON rk.key = kcp.key
+            WHERE kcp.reacted = 0 AND rk.redeemed_by IS NOT NULL
+            """
+        ).fetchall()
+    finally:
+        database.close()
+
+
+def get_key_channel_message(key: str) -> sqlite3.Row | None:
+    database = connect_database()
+    try:
+        return database.execute(
+            "SELECT channel_id, message_id, reacted FROM key_channel_posts WHERE key = ?",
+            (key,),
+        ).fetchone()
+    finally:
+        database.close()
+
+
+def mark_key_redeemed_manually(key: str, marked_by: int) -> str:
+    """Force a key to 'redeemed' without going through the normal role-grant flow.
+
+    Used for keys you already know were claimed outside the bot (e.g. handed to a
+    friend directly). Returns 'success', 'invalid', or 'already'.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    database = connect_database()
+    try:
+        database.execute("BEGIN IMMEDIATE")
+        key_row = database.execute(
+            "SELECT redeemed_by FROM redeem_keys WHERE key = ?", (key,)
+        ).fetchone()
+        if key_row is None:
+            database.rollback()
+            return "invalid"
+        if key_row["redeemed_by"] is not None:
+            database.rollback()
+            return "already"
+
+        database.execute(
+            """
+            UPDATE redeem_keys
+            SET redeemed_by = ?, redeemed_at = ?
+            WHERE key = ? AND redeemed_by IS NULL
+            """,
+            (marked_by, timestamp, key),
+        )
+        database.commit()
+        return "success"
     except Exception:
         database.rollback()
         raise
@@ -660,6 +792,29 @@ async def send_redemption_log(member: discord.Member, key: str) -> None:
         await channel.send(embed=embed)
 
 
+async def react_to_redeemed_key(key: str) -> None:
+    """If this key has a posted channel message, add the redeemed tick to it."""
+    row = await asyncio.to_thread(get_key_channel_message, key)
+    if row is None or row["reacted"]:
+        return
+
+    channel_id = int(row["channel_id"])
+    message_id = int(row["message_id"])
+    try:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+        message = await channel.fetch_message(message_id)
+        await message.add_reaction(KEY_REDEEMED_EMOJI)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        logger.exception("Could not add redeemed tick for key message (key=%s)", key)
+        return
+
+    await asyncio.to_thread(mark_key_message_reacted, key)
+
+
 class RedeemModal(discord.ui.Modal, title="Redeem Your Key"):
     key_input = discord.ui.TextInput(
         label="Key",
@@ -737,6 +892,11 @@ class RedeemModal(discord.ui.Modal, title="Redeem Your Key"):
                 "Could not send redemption log for user %s", interaction.user.id
             )
 
+        try:
+            await react_to_redeemed_key(key)
+        except Exception:
+            logger.exception("Could not react to redeemed key message for %s", key)
+
         await interaction.followup.send(
             f"Key redeemed successfully — you now have the {role.mention} role!",
             ephemeral=True,
@@ -789,6 +949,8 @@ class QuantumBot(commands.Bot):
             logger.warning(
                 "SellAuth purchase DMs are disabled until SELLAUTH_API_KEY is set"
             )
+
+        self.key_redemption_watch.start()
 
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)
@@ -1118,9 +1280,46 @@ class QuantumBot(commands.Bot):
     async def before_sellauth_purchase_poll(self) -> None:
         await self.wait_until_ready()
 
+    @tasks.loop(seconds=60)
+    async def key_redemption_watch(self) -> None:
+        """Safety-net sweep: tick any posted key message whose key is now redeemed.
+
+        Redemptions normally get their tick immediately via react_to_redeemed_key,
+        this loop just catches anything that was missed (e.g. a transient Discord
+        error) at most a minute later.
+        """
+        try:
+            rows = await asyncio.to_thread(get_unreacted_redeemed_key_messages)
+        except Exception:
+            logger.exception("Could not read pending key reactions")
+            return
+
+        for row in rows:
+            key = str(row["key"])
+            channel_id = int(row["channel_id"])
+            message_id = int(row["message_id"])
+            try:
+                channel = self.get_channel(channel_id)
+                if channel is None:
+                    channel = await self.fetch_channel(channel_id)
+                if not isinstance(channel, discord.abc.Messageable):
+                    continue
+                message = await channel.fetch_message(message_id)
+                await message.add_reaction(KEY_REDEEMED_EMOJI)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                logger.exception("Could not add redeemed tick for key message (key=%s)", key)
+                continue
+            await asyncio.to_thread(mark_key_message_reacted, key)
+
+    @key_redemption_watch.before_loop
+    async def before_key_redemption_watch(self) -> None:
+        await self.wait_until_ready()
+
     async def close(self) -> None:
         if self.sellauth_purchase_poll.is_running():
             self.sellauth_purchase_poll.cancel()
+        if self.key_redemption_watch.is_running():
+            self.key_redemption_watch.cancel()
         await super().close()
 
 
@@ -1231,6 +1430,165 @@ async def mod_update(
 
 
 bot.tree.add_command(mod_group)
+
+
+keys_group = app_commands.Group(
+    name="keys", description="Quantum supporter key channel tools"
+)
+
+
+@keys_group.command(
+    name="post",
+    description="Post every key as its own message in the key channel (skips ones already posted)",
+)
+async def keys_post(interaction: discord.Interaction) -> None:
+    if not await bot.is_owner(interaction.user):
+        await interaction.response.send_message(
+            "Only the bot owner can use `/keys post`.", ephemeral=True
+        )
+        return
+
+    if KEY_REDEMPTION_CHANNEL_ID <= 0:
+        await interaction.response.send_message(
+            "The key channel has not been configured.", ephemeral=True
+        )
+        return
+
+    channel = bot.get_channel(KEY_REDEMPTION_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(KEY_REDEMPTION_CHANNEL_ID)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            await interaction.response.send_message(
+                "I could not access the configured key channel.", ephemeral=True
+            )
+            return
+    if not isinstance(channel, discord.abc.Messageable):
+        await interaction.response.send_message(
+            "The configured key channel cannot receive messages.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    all_keys = await asyncio.to_thread(get_all_keys_with_status)
+    already_posted = await asyncio.to_thread(get_posted_keys)
+    to_post = [row for row in all_keys if str(row["key"]) not in already_posted]
+
+    posted = 0
+    ticked = 0
+    failed = 0
+    for row in to_post:
+        key = str(row["key"])
+        is_redeemed = row["redeemed_by"] is not None
+        try:
+            message = await channel.send(f"`{key}`")
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception("Could not post key message for %s", key)
+            failed += 1
+            continue
+
+        if is_redeemed:
+            try:
+                await message.add_reaction(KEY_REDEEMED_EMOJI)
+                await asyncio.to_thread(
+                    save_key_channel_post, key, channel.id, message.id, True
+                )
+                ticked += 1
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception("Could not tick already-redeemed key %s", key)
+                await asyncio.to_thread(
+                    save_key_channel_post, key, channel.id, message.id, False
+                )
+        else:
+            await asyncio.to_thread(
+                save_key_channel_post, key, channel.id, message.id, False
+            )
+        posted += 1
+
+        # Stay well under Discord's rate limits when posting a large batch.
+        await asyncio.sleep(1)
+
+    await interaction.followup.send(
+        f"Posted {posted} new key message(s) to <#{KEY_REDEMPTION_CHANNEL_ID}> "
+        f"({ticked} already redeemed, {failed} failed, "
+        f"{len(already_posted)} were already posted previously).",
+        ephemeral=True,
+    )
+
+
+@keys_group.command(
+    name="sync",
+    description="Re-check the key channel now and tick any newly redeemed keys",
+)
+async def keys_sync(interaction: discord.Interaction) -> None:
+    if not await bot.is_owner(interaction.user):
+        await interaction.response.send_message(
+            "Only the bot owner can use `/keys sync`.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    rows = await asyncio.to_thread(get_unreacted_redeemed_key_messages)
+    ticked = 0
+    for row in rows:
+        key = str(row["key"])
+        try:
+            await react_to_redeemed_key(key)
+            ticked += 1
+        except Exception:
+            logger.exception("Could not tick key %s during manual sync", key)
+
+    await interaction.followup.send(
+        f"Checked {len(rows)} pending key(s), added the tick to {ticked}.",
+        ephemeral=True,
+    )
+
+
+@keys_group.command(
+    name="markredeemed",
+    description="Mark keys as already redeemed outside the bot (e.g. given to friends directly)",
+)
+@app_commands.describe(keys="One or more keys, space or comma separated")
+async def keys_markredeemed(interaction: discord.Interaction, keys: str) -> None:
+    if not await bot.is_owner(interaction.user):
+        await interaction.response.send_message(
+            "Only the bot owner can use `/keys markredeemed`.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    candidates = [normalize_key(part) for part in re.split(r"[\s,]+", keys) if part.strip()]
+    succeeded: list[str] = []
+    already: list[str] = []
+    invalid: list[str] = []
+
+    for key in candidates:
+        status = await asyncio.to_thread(
+            mark_key_redeemed_manually, key, interaction.user.id
+        )
+        if status == "success":
+            succeeded.append(key)
+            try:
+                await react_to_redeemed_key(key)
+            except Exception:
+                logger.exception("Could not tick manually-redeemed key %s", key)
+        elif status == "already":
+            already.append(key)
+        else:
+            invalid.append(key)
+
+    summary = (
+        f"Marked {len(succeeded)} key(s) redeemed."
+        f" Already redeemed: {len(already)}. Invalid/unknown: {len(invalid)}."
+    )
+    if invalid:
+        summary += f"\nInvalid: {', '.join(f'`{k}`' for k in invalid[:20])}"
+    await interaction.followup.send(summary, ephemeral=True)
+
+
+bot.tree.add_command(keys_group)
 
 
 @bot.tree.command(name="redeem", description="Open the key redemption panel")
