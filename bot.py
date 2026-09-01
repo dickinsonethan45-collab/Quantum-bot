@@ -1498,19 +1498,24 @@ async def mod_update(
         if not isinstance(channel, discord.abc.Messageable):
             raise TypeError("Configured mod-update channel cannot receive messages")
 
+        ping_content = f"<@&{SUPPORTKEYS_COMMAND_ROLE_ID}>"
+        ping_mentions = discord.AllowedMentions(roles=[discord.Object(id=SUPPORTKEYS_COMMAND_ROLE_ID)])
+
         if LOGO_FILE.exists():
             logo = discord.File(LOGO_FILE, filename="quantum-update-logo.png")
             embed.set_thumbnail(url="attachment://quantum-update-logo.png")
             await channel.send(
+                content=ping_content,
                 embed=embed,
                 file=logo,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=ping_mentions,
             )
         else:
             logger.warning("Logo file is missing: %s", LOGO_FILE)
             await channel.send(
+                content=ping_content,
                 embed=embed,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=ping_mentions,
             )
     except (discord.Forbidden, discord.NotFound, discord.HTTPException, TypeError):
         logger.exception("Could not send Quantum Mods update")
