@@ -1,0 +1,130 @@
+"""One-time migration: restore redemptions that existed before the DB reset.
+
+Run this ONCE, in the same environment/volume the bot actually uses (i.e. set
+DATA_DIR the same way Railway does, or run it via `railway run python
+restore_redemptions.py` from the project root). It is safe to re-run: already
+matching rows are skipped, and it will never overwrite a key that's redeemed
+by a *different* user than the one listed here.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR))).expanduser()
+DATABASE_FILE = DATA_DIR / "redemptions.db"
+KEYS_FILE = BASE_DIR / "keys.txt"
+
+# (key, discord_user_id) pairs recovered from the pre-reset redemption log.
+RESTORED_REDEMPTIONS: list[tuple[str, int]] = [
+    ("L7M4-H8R2-Y6P9", 714989922573877298),
+    ("T5M2-Q9P6-X4H8", 1385029210892144812),
+    ("A7K2-9M4X-Q8P3", 1157316232840749126),
+    ("A4P9-H2T7-X5C8", 934227261262028820),
+    ("M3V7-X5N8-K9Q2", 1323647355404161110),
+    ("N9T4-L7D2-W6Q5", 1398820694153760848),
+    ("K3M7-C8X5-R9T2", 1420227061666021376),
+    ("4K7M-9Q2X-L8R5", 1449816360954761389),
+    ("8N3P-6V9C-T2W7", 1477545388121526376),
+    ("1X5R-8M4K-Q7N2", 1420905296120774807),
+    ("Z4F8-L3Y6-S7J2", 1502509044726763591),
+    ("E6V3-G9P7-U4X8", 1512031135100567572),
+    ("E5R9-X2N8-H7W4", 1297851572054917152),
+    ("Z3V9-C7P5-Y4K8", 1504229272703860816),
+]
+
+# Obvious leftover test data from before launch — not a real key/user pair.
+STRAY_TEST_ROWS = [
+    ("1111-1111-1111", 1024379666833866923),
+]
+
+
+def ensure_keys_present(conn: sqlite3.Connection) -> None:
+    """Make sure every key we're about to restore actually exists in
+    redeem_keys, in case this runs before bot.py's own startup migration
+    (which normally loads keys.txt into the table)."""
+    if not KEYS_FILE.exists():
+        return
+    wanted = {key for key, _ in RESTORED_REDEMPTIONS}
+    for raw_line in KEYS_FILE.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key = line.upper()
+        if key in wanted:
+            conn.execute("INSERT OR IGNORE INTO redeem_keys (key) VALUES (?)", (key,))
+
+
+def main() -> None:
+    if not DATABASE_FILE.exists():
+        raise SystemExit(f"No database at {DATABASE_FILE} — check DATA_DIR.")
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DATABASE_FILE)
+    conn.row_factory = sqlite3.Row
+    ensure_keys_present(conn)
+
+    restored = 0
+    skipped: list[str] = []
+
+    for key, user_id in RESTORED_REDEMPTIONS:
+        key_row = conn.execute(
+            "SELECT redeemed_by FROM redeem_keys WHERE key = ?", (key,)
+        ).fetchone()
+        if key_row is None:
+            skipped.append(f"{key}: not found in redeem_keys (check keys.txt)")
+            continue
+        if key_row["redeemed_by"] is not None and key_row["redeemed_by"] != user_id:
+            skipped.append(
+                f"{key}: already redeemed by {key_row['redeemed_by']}, not {user_id} — left alone"
+            )
+            continue
+
+        user_row = conn.execute(
+            "SELECT key FROM redeemed_users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if user_row is not None and user_row["key"] != key:
+            skipped.append(
+                f"{key}: user {user_id} already has a different key ({user_row['key']}) on file — left alone"
+            )
+            continue
+
+        conn.execute(
+            "UPDATE redeem_keys SET redeemed_by = ?, redeemed_at = COALESCE(redeemed_at, ?) WHERE key = ?",
+            (user_id, timestamp, key),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO redeemed_users (user_id, key, redeemed_at) VALUES (?, ?, ?)",
+            (user_id, key, timestamp),
+        )
+        restored += 1
+
+    removed_stray = 0
+    for key, user_id in STRAY_TEST_ROWS:
+        cur = conn.execute(
+            "DELETE FROM redeemed_users WHERE user_id = ? AND key = ?", (user_id, key)
+        )
+        removed_stray += cur.rowcount
+        conn.execute(
+            "UPDATE redeem_keys SET redeemed_by = NULL, redeemed_at = NULL WHERE key = ? AND redeemed_by = ?",
+            (key, user_id),
+        )
+
+    conn.commit()
+    conn.close()
+
+    print(f"Restored {restored}/{len(RESTORED_REDEMPTIONS)} redemptions.")
+    if removed_stray:
+        print(f"Cleared {removed_stray} stray test row(s) (e.g. 1111-1111-1111).")
+    if skipped:
+        print("\nSkipped:")
+        for line in skipped:
+            print(" -", line)
+
+
+if __name__ == "__main__":
+    main()
